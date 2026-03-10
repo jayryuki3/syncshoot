@@ -44,7 +44,7 @@ from config import (
     TransferStatus,
 )
 
-# ── Logging Setup ─────────────────────────────────────────────────────────────
+# ── Logging Setup ─────────────────────────────────────────────────────────────────
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -58,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger(APP_NAME)
 
 
-# ── SQLite Initialisation ─────────────────────────────────────────────────────
+# ── SQLite Initialisation ─────────────────────────────────────────────────────────
 def init_database():
     """Ensure all SQLite tables exist."""
     import sqlite3
@@ -84,15 +84,12 @@ def init_database():
         )
     """)
 
-    # Snapshots and schedules are created by their respective modules
-    # (scanner.py and scheduler.py) on first use
-
     db.commit()
     db.close()
     logger.info(f"Database initialised: {DB_PATH}")
 
 
-# ── CLI: Run Task ─────────────────────────────────────────────────────────────
+# ── CLI: Run Task ─────────────────────────────────────────────────────────────────
 def run_task_cli(task_path: str):
     """Run a saved task in headless mode."""
     from engine.copier import TransferJob, run_transfer, TransferControl
@@ -162,10 +159,14 @@ def run_task_cli(task_path: str):
                 f"{len(report.corrupted)} corrupted")
 
     if not report.all_passed:
+        for r in report.corrupted_files:
+            logger.error(f"  CORRUPTED: {r.rel_path} — {r.error}")
+        for r in report.failed_files:
+            logger.error(f"  FAILED: {r.rel_path} — {r.error}")
         sys.exit(1)
 
 
-# ── CLI: Verify Volume ────────────────────────────────────────────────────────
+# ── CLI: Verify Volume ────────────────────────────────────────────────────────────
 def verify_volume_cli(volume_path: str):
     """Verify all files on a volume using existing MHL files."""
     from utils.mhl import find_mhl_files, extract_checksums
@@ -206,7 +207,7 @@ def verify_volume_cli(volume_path: str):
         sys.exit(1)
 
 
-# ── CLI: Generate MHL ─────────────────────────────────────────────────────────
+# ── CLI: Generate MHL ─────────────────────────────────────────────────────────────
 def generate_mhl_cli(dir_path: str):
     """Generate MHL for a directory."""
     from engine.hasher import hash_files
@@ -245,10 +246,35 @@ def _walk(root):
     yield from os.walk(root)
 
 
-# ── History Recording ─────────────────────────────────────────────────────────
-def _record_history(config: dict, job, report):
+# ── History Recording ─────────────────────────────────────────────────────────────
+def _record_history(config: dict, result_or_job, report=None):
+    """Record a completed transfer in the SQLite history table.
+
+    Accepts either a SyncResult (GUI path) or a TransferJob (CLI path).
+    """
     import sqlite3
     db = sqlite3.connect(str(DB_PATH))
+
+    # Normalise fields from either result type
+    if hasattr(result_or_job, "files_copied"):  # SyncResult
+        r = result_or_job
+        status = r.status.value if hasattr(r.status, "value") else str(r.status)
+        total_files = r.files_copied + r.files_skipped + r.files_failed
+        total_bytes = r.bytes_transferred
+        successful = r.files_copied
+        failed = r.files_failed
+        started = getattr(r, "started_at", 0)
+        finished = getattr(r, "finished_at", 0)
+    else:  # TransferJob (CLI path)
+        job = result_or_job
+        status = job.status.value if hasattr(job.status, "value") else str(job.status)
+        total_files = report.total_files if report else 0
+        total_bytes = report.total_bytes if report else 0
+        successful = len(report.successful) if report else 0
+        failed = len(report.failed) if report else 0
+        started = getattr(job, "started_at", 0)
+        finished = getattr(job, "finished_at", 0)
+
     db.execute(
         """INSERT INTO transfer_history
            (task_name, source, destinations, status, started_at, finished_at,
@@ -258,10 +284,11 @@ def _record_history(config: dict, job, report):
             config.get("task_name", ""),
             config.get("source", ""),
             json.dumps(config.get("destinations", [])),
-            job.status.value,
-            job.started_at, job.finished_at,
-            report.total_files, report.total_bytes,
-            len(report.successful), len(report.failed), len(report.corrupted),
+            status,
+            started, finished,
+            total_files, total_bytes,
+            successful, failed,
+            0,  # corrupted
             "",
         ),
     )
@@ -269,7 +296,92 @@ def _record_history(config: dict, job, report):
     db.close()
 
 
-# ── GUI Launch ────────────────────────────────────────────────────────────────
+# ── macOS Permission Check ────────────────────────────────────────────────────────
+def check_file_access(source: str, destinations: list[str]) -> tuple[bool, str]:
+    """Test read access on source and write access on each destination.
+
+    Returns (ok, error_message).  On macOS the OS may silently deny
+    access if Full Disk Access / Files & Folders has not been granted.
+    """
+    src = Path(source)
+    if not src.exists():
+        return False, f"Source does not exist:\n{src}"
+    # Read test — try listing contents
+    try:
+        next(src.iterdir(), None)
+    except PermissionError:
+        return False, (
+            f"Cannot read source folder:\n{src}\n\n"
+            "On macOS, open System Settings \u2192 Privacy & Security \u2192 "
+            "Full Disk Access and add SyncShoot."
+        )
+    except OSError as e:
+        return False, f"Cannot access source:\n{e}"
+
+    for d in destinations:
+        dp = Path(d)
+        try:
+            dp.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            return False, (
+                f"Cannot create destination folder:\n{dp}\n\n"
+                "On macOS, open System Settings \u2192 Privacy & Security \u2192 "
+                "Full Disk Access and add SyncShoot."
+            )
+        except OSError as e:
+            return False, f"Cannot create destination:\n{e}"
+        # Write test — try creating a temp file
+        try:
+            tmp = dp / ".syncshoot_access_test"
+            tmp.write_text("test")
+            tmp.unlink()
+        except PermissionError:
+            return False, (
+                f"Cannot write to destination:\n{dp}\n\n"
+                "On macOS, open System Settings \u2192 Privacy & Security \u2192 "
+                "Full Disk Access and add SyncShoot."
+            )
+        except OSError as e:
+            return False, f"Cannot write to destination:\n{e}"
+
+    return True, ""
+
+
+def open_macos_privacy_settings():
+    """Open the macOS Privacy & Security pane (Full Disk Access)."""
+    import platform
+    import subprocess
+    if platform.system() == "Darwin":
+        try:
+            subprocess.Popen([
+                "open",
+                "x-apple.systempreferences:"
+                "com.apple.preference.security?Privacy_AllFiles",
+            ])
+        except Exception:
+            pass
+
+
+# ── Formatting Helpers ────────────────────────────────────────────────────────────
+def _fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _fmt_elapsed(secs):
+    if secs < 60:
+        return f"{secs:.1f}s"
+    mins, s = divmod(int(secs), 60)
+    if mins < 60:
+        return f"{mins}m {s}s"
+    hrs, m = divmod(mins, 60)
+    return f"{hrs}h {m}m {s}s"
+
+
+# ── GUI Launch ────────────────────────────────────────────────────────────────────
 def launch_gui():
     """Launch the full GUI application."""
     from gui.app import SyncShootApp
@@ -304,21 +416,23 @@ def launch_gui():
     # -- Wire Task Editor signals to engine --
     from engine.sync import plan_sync, execute_sync
     from engine.sync import SyncMode as EngSyncMode
-    from PySide6.QtCore import QThread, QObject
+    from PySide6.QtCore import Qt, QThread, QObject, QTimer
     from PySide6.QtCore import Signal as QtSignal
-    from PySide6.QtWidgets import QMessageBox
+    from PySide6.QtWidgets import (
+        QMessageBox, QDialog, QVBoxLayout, QLabel,
+        QTextEdit, QPushButton, QHBoxLayout,
+    )
+    from utils.notifications import (
+        notify_transfer_complete,
+        notify_corruption_detected,
+        play_completion_sound,
+    )
+    from utils.report import TransferReport, FileResult, save_report
 
     _active_workers = []
-    _transfer_counter = [0]  # mutable counter for unique IDs
+    _transfer_counter = [0]
     _stats = {"active": 0, "complete": 0, "failed": 0,
               "bytes": 0, "speed_samples": []}
-
-    def _fmt_bytes(n):
-        for unit in ("B", "KB", "MB", "GB", "TB"):
-            if abs(n) < 1024:
-                return f"{n:.1f} {unit}"
-            n /= 1024
-        return f"{n:.1f} PB"
 
     def _refresh_dashboard_stats():
         avg_speed = 0.0
@@ -334,18 +448,120 @@ def launch_gui():
         )
         window.set_active_count(_stats["active"])
 
+    # ---- Transfer Summary Dialog ----
+    def _show_transfer_summary(task_name, result, report_path=None):
+        """Show a summary dialog after a transfer finishes."""
+        dlg = QDialog(window)
+        dlg.setWindowTitle(f"Transfer Summary \u2014 {task_name}")
+        dlg.setMinimumWidth(500)
+        layout = QVBoxLayout(dlg)
+
+        success = result.files_failed == 0
+        status_text = "COMPLETED" if success else "COMPLETED WITH ERRORS"
+        status_color = "#4CAF50" if success else "#FF5252"
+        header = QLabel(f'<h2 style="color:{status_color}">{status_text}</h2>')
+        layout.addWidget(header)
+
+        speed = result.bytes_transferred / (1024 * 1024 * max(result.elapsed, 0.01))
+        summary_html = "<br>".join([
+            f"<b>Task:</b> {task_name}",
+            f"<b>Source:</b> {result.plan.source}",
+            f"<b>Destination:</b> {result.plan.destination}",
+            "",
+            f"<b>Files copied:</b> {result.files_copied}",
+            f"<b>Files skipped:</b> {result.files_skipped}",
+            f"<b>Files failed:</b> {result.files_failed}",
+            f"<b>Files deleted:</b> {result.files_deleted}",
+            "",
+            f"<b>Data transferred:</b> {_fmt_bytes(result.bytes_transferred)}",
+            f"<b>Average speed:</b> {speed:.1f} MB/s",
+            f"<b>Elapsed:</b> {_fmt_elapsed(result.elapsed)}",
+        ])
+        summary_label = QLabel(summary_html)
+        summary_label.setTextFormat(Qt.RichText)
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+
+        # Error details
+        if result.errors:
+            err_header = QLabel(f"<b style='color:#FF5252'>Errors ({len(result.errors)}):</b>")
+            layout.addWidget(err_header)
+            err_text = QTextEdit()
+            err_text.setReadOnly(True)
+            err_text.setMaximumHeight(150)
+            err_lines = [f"{path}: {msg}" for path, msg in result.errors[:50]]
+            if len(result.errors) > 50:
+                err_lines.append(f"... and {len(result.errors) - 50} more")
+            err_text.setPlainText("\n".join(err_lines))
+            layout.addWidget(err_text)
+
+        # Buttons row
+        btn_layout = QHBoxLayout()
+        if report_path:
+            open_btn = QPushButton("Open Report")
+            _rp = str(report_path)
+            def _open_report(checked=False, rp=_rp):
+                import subprocess as _sp
+                import platform as _pf
+                if _pf.system() == "Darwin":
+                    _sp.Popen(["open", rp])
+                elif _pf.system() == "Windows":
+                    _sp.Popen(["start", rp], shell=True)
+                else:
+                    _sp.Popen(["xdg-open", rp])
+            open_btn.clicked.connect(_open_report)
+            btn_layout.addWidget(open_btn)
+
+        close_btn = QPushButton("OK")
+        close_btn.clicked.connect(dlg.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        dlg.exec()
+
+    # ---- Permission-checked launch ----
+    def _check_access(config):
+        """Validate file access before starting a transfer."""
+        src = config.get("source", "")
+        dsts = config.get("destinations", [])
+        ok, err_msg = check_file_access(src, dsts)
+        if not ok:
+            box = QMessageBox(window)
+            box.setIcon(QMessageBox.Critical)
+            box.setWindowTitle("Permission Denied")
+            box.setText(err_msg)
+            box.addButton("Open System Settings", QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Cancel)
+            result = box.exec()
+            # ActionRole button returns 0
+            if result == 0:
+                open_macos_privacy_settings()
+            return False
+        return True
+
+    # ---- Sync Worker ----
     class _SyncWorker(QObject):
-        finished = QtSignal(object)
+        finished = QtSignal(object)   # SyncResult or SyncPlan
         error = QtSignal(str)
         progress = QtSignal(int, int, str, str)  # done, total, file, op
+
         def __init__(self, cfg, execute=False):
             super().__init__()
             self._cfg = cfg
             self._execute = execute
+
         def run(self):
             try:
                 src = Path(self._cfg["source"])
                 dst = Path(self._cfg["destinations"][0])
+
+                # Preserve source folder name at destination
+                # e.g. source=/Volumes/Card/DCIM, dest=/Backup
+                #   -> actual dest becomes /Backup/DCIM/
+                if self._cfg.get("preserve_folder_name", True):
+                    dst = dst / src.name
+                    dst.mkdir(parents=True, exist_ok=True)
+
                 mode = EngSyncMode(
                     self._cfg.get("sync_mode", "backup")
                 )
@@ -363,11 +579,15 @@ def launch_gui():
             except Exception as e:
                 self.error.emit(str(e))
 
+    # ---- Trial Sync ----
     def _on_trial_sync(config):
+        if not _check_access(config):
+            return
         window.set_status("Running Trial Sync...")
         w = _SyncWorker(config, execute=False)
         t = QThread(window)
         w.moveToThread(t)
+
         def done(plan):
             ops = []
             for o in plan.operations:
@@ -386,40 +606,50 @@ def launch_gui():
                 f"Trial done: {nc} copy, {nd} del, {ns} skip"
             )
             t.quit()
+
         def err(msg):
             QMessageBox.critical(
                 window, "Trial Sync Error", msg
             )
             window.set_status("Trial Sync failed")
             t.quit()
+
         w.finished.connect(done)
         w.error.connect(err)
         t.started.connect(w.run)
         t.start()
         _active_workers.append((t, w))
 
+    # ---- Run Single Task (with full dashboard + notifications + report) ----
     def _run_single_task(config):
-        """Run a single task config with dashboard integration."""
+        """Run a single task with permission check, dashboard card,
+        notifications, report generation, and summary dialog."""
+        if not _check_access(config):
+            return
+
         import time as _time
         _transfer_counter[0] += 1
         tid = f"transfer_{_transfer_counter[0]}_{int(_time.time())}"
         task_name = config.get("task_name", "Untitled")
         src = config.get("source", "?")
         dst = config.get("destinations", ["?"])[0]
-        label = f"{task_name} ({Path(src).name} -> {Path(dst).name})"
+        label = f"{task_name} ({Path(src).name} \u2192 {Path(dst).name})"
 
+        # Create dashboard card immediately
         card = dashboard.add_transfer(tid, label)
         from config import TransferStatus as TS
         card.update_status(TS.INDEXING)
         _stats["active"] += 1
         _refresh_dashboard_stats()
+        window.set_status(f"Starting: {task_name}...")
+        # Switch to dashboard so user sees activity
+        window._switch_panel(0)
 
         w = _SyncWorker(config, execute=True)
         t = QThread(window)
         w.moveToThread(t)
 
         _start_time = [_time.time()]
-        _bytes_so_far = [0]
 
         def on_progress(done, total, rel_path, op_type):
             if total == 0:
@@ -427,7 +657,11 @@ def launch_gui():
             else:
                 pct = int(done / total * 100)
             elapsed = _time.time() - _start_time[0]
-            speed = _bytes_so_far[0] / (1024 * 1024 * max(elapsed, 0.01))
+            # Estimate speed from progress ratio and elapsed
+            if elapsed > 0 and done > 0:
+                speed = (done / total * config_total_bytes) / (1024 * 1024 * elapsed) if 'config_total_bytes' in dir() else 0.0
+            else:
+                speed = 0.0
             if total > done:
                 remaining = (elapsed / max(done, 1)) * (total - done)
                 mins, secs = divmod(int(remaining), 60)
@@ -438,6 +672,7 @@ def launch_gui():
             card.update_progress(pct, rel_path, speed, eta, size_str)
             card.update_status(TS.COPYING)
             window.set_speed(speed)
+            window.set_status(f"{task_name}: {pct}% \u2014 {rel_path}")
 
         def on_done(result):
             _stats["active"] = max(0, _stats["active"] - 1)
@@ -447,9 +682,13 @@ def launch_gui():
             _stats["speed_samples"].append(spd)
             if len(_stats["speed_samples"]) > 20:
                 _stats["speed_samples"] = _stats["speed_samples"][-20:]
+
             c = result.files_copied
             s = result.files_skipped
             f = result.files_failed
+            success = f == 0
+
+            # Update dashboard card
             if f > 0:
                 card.update_status(TS.FAILED)
                 _stats["failed"] += 1
@@ -467,6 +706,62 @@ def launch_gui():
                 f"{task_name}: {c} copied, {s} skipped, {f} failed"
             )
             window.set_speed(0.0)
+
+            # Generate HTML report
+            report_path = None
+            try:
+                file_results_failed = [
+                    FileResult(
+                        rel_path=err_path,
+                        status="failed",
+                        error=err_msg,
+                    )
+                    for err_path, err_msg in result.errors
+                ]
+                file_results_ok = [
+                    FileResult(rel_path=f"({c} files copied)", status="success")
+                ] if c > 0 else []
+                report = TransferReport(
+                    task_name=task_name,
+                    source=str(result.plan.source),
+                    destinations=[str(result.plan.destination)],
+                    started_at=_start_time[0],
+                    finished_at=_start_time[0] + result.elapsed,
+                    total_files=c + s + f,
+                    total_bytes=result.bytes_transferred,
+                    successful=file_results_ok,
+                    failed=file_results_failed,
+                    corrupted=[],
+                    all_passed=success,
+                )
+                rp = save_report(report, ReportFormat.HTML)
+                report_path = rp
+                logger.info(f"Report saved: {rp}")
+            except Exception as e:
+                logger.warning(f"Report generation failed: {e}")
+
+            # Record in history DB
+            try:
+                _record_history(config, result, report if report_path else None)
+            except Exception as e:
+                logger.warning(f"History recording failed: {e}")
+
+            # System notification + sound
+            try:
+                notify_transfer_complete(
+                    task_name=task_name,
+                    total_files=c + s + f,
+                    total_size_str=_fmt_bytes(result.bytes_transferred),
+                    elapsed_str=_fmt_elapsed(result.elapsed),
+                    failed_count=f,
+                )
+                play_completion_sound(success=success)
+            except Exception as e:
+                logger.warning(f"Notification failed: {e}")
+
+            # Show summary dialog
+            _show_transfer_summary(task_name, result, report_path)
+
             t.quit()
 
         def on_err(msg):
@@ -475,9 +770,21 @@ def launch_gui():
             card.update_status(TS.FAILED)
             card.update_progress(0, f"Error: {msg}", 0.0, "--", "--")
             _refresh_dashboard_stats()
-            QMessageBox.critical(window, "Task Error", msg)
-            window.set_status(f"{task_name} failed")
+            window.set_status(f"{task_name} failed: {msg}")
             window.set_speed(0.0)
+            # Notify on error
+            try:
+                notify_transfer_complete(
+                    task_name=task_name,
+                    total_files=0,
+                    total_size_str="0 B",
+                    elapsed_str="--",
+                    failed_count=1,
+                )
+                play_completion_sound(success=False)
+            except Exception:
+                pass
+            QMessageBox.critical(window, "Task Error", msg)
             t.quit()
 
         w.progress.connect(on_progress)
@@ -487,8 +794,9 @@ def launch_gui():
         t.start()
         _active_workers.append((t, w))
 
+    # ---- Button handlers ----
     def _on_run_task(config):
-        """Run Now button handler — delegates to _run_single_task."""
+        """Run Now button handler."""
         _run_single_task(config)
 
     def _on_task_saved(path):
@@ -575,11 +883,11 @@ def launch_gui():
     return exit_code
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
         prog=APP_NAME.lower(),
-        description=f"{APP_NAME} v{APP_VERSION} — High-performance file transfer, sync & backup",
+        description=f"{APP_NAME} v{APP_VERSION} \u2014 High-performance file transfer, sync & backup",
     )
     parser.add_argument("--headless", action="store_true", help="Run in CLI mode (no GUI)")
     parser.add_argument("--run-task", metavar="TASK.json", help="Run a saved task file")
@@ -600,7 +908,6 @@ def main():
         generate_mhl_cli(args.generate_mhl)
     elif args.headless:
         logger.info(f"{APP_NAME} running in headless mode. Use --run-task to execute a task.")
-        # Could start scheduler loop here for daemon mode
         from engine.scheduler import Scheduler
         scheduler = Scheduler()
         scheduler.recover_missed()
