@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
     # Signals
     pause_all_signal = Signal()
     resume_all_signal = Signal()
+    task_file_opened = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -310,7 +311,7 @@ class MainWindow(QMainWindow):
             self, "Open Task", "", "Task Files (*.json);;All Files (*)"
         )
         if path:
-            self.set_status(f"Opened: {path}")
+            self.task_file_opened.emit(path)
 
     def _on_import_task(self):
         path, _ = QFileDialog.getOpenFileName(
