@@ -70,6 +70,8 @@ class MainWindow(QMainWindow):
     pause_all_signal = Signal()
     resume_all_signal = Signal()
     task_file_opened = Signal(str)
+    new_task_requested = Signal()
+    run_all_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -304,6 +306,7 @@ class MainWindow(QMainWindow):
 
     # ── Actions ───────────────────────────────────────────────────────────
     def _on_new_task(self):
+        self.new_task_requested.emit()
         self._switch_panel(1)  # Switch to Tasks panel
 
     def _on_open_task(self):
@@ -351,6 +354,7 @@ class MainWindow(QMainWindow):
 
     def _on_run_all(self):
         self.set_status("Running all tasks...")
+        self.run_all_requested.emit()
 
     def _on_stop_all(self):
         self.set_status("Stopping all tasks...")
