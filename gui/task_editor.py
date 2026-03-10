@@ -401,6 +401,34 @@ class TaskEditorPanel(QWidget):
         self.trial_sync_requested.emit(config)
         self._preview_label.setText("Running Trial Sync...")
 
+    def reset_form(self):
+        """Clear all fields to defaults for a fresh new task."""
+        self._task_name.clear()
+        self._sync_mode.setCurrentIndex(0)
+        self._source_path.clear()
+        self._dest_list.clear()
+        self._cascade_check.setChecked(False)
+        self._verify_mode.setCurrentIndex(3)  # SOURCE_DESTINATION
+        self._hash_algo.setCurrentIndex(0)
+        self._safe_copy.setChecked(True)
+        self._skip_dupes.setChecked(True)
+        self._move_mode.setChecked(False)
+        self._throttle.setValue(0)
+        self._archive_enabled.setChecked(True)
+        self._archive_versions.setValue(10)
+        self._archive_days.setValue(90)
+        self._archive_compress.setChecked(False)
+        self._filter_hidden.setChecked(True)
+        self._filter_junk.setChecked(True)
+        self._filter_temp.setChecked(True)
+        self._filter_media.setChecked(False)
+        self._custom_ext.clear()
+        self._preview_list.clear()
+        self._preview_list.hide()
+        self._preview_label.setText("Click 'Run Trial Sync' to preview planned operations.")
+        self._preview_label.show()
+        self._tabs.setCurrentIndex(0)
+
     def load_config(self, config: dict):
         """Load a task config dict into the UI."""
         self._task_name.setText(config.get("task_name", ""))
