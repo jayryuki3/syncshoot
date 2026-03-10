@@ -50,6 +50,7 @@ class TaskEditorPanel(QWidget):
 
     task_saved = Signal(str)        # task file path
     trial_sync_requested = Signal(dict)  # task config dict
+    run_requested = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -374,6 +375,7 @@ class TaskEditorPanel(QWidget):
         if not config["destinations"]:
             QMessageBox.warning(self, "Missing Destination", "Please add at least one destination.")
             return
+        TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
         name = config["task_name"].replace(" ", "_").replace("/", "_")
         path = TASKS_DIR / f"{name}.json"
@@ -383,7 +385,13 @@ class TaskEditorPanel(QWidget):
 
     def _on_run(self):
         config = self._build_config()
-        self.trial_sync_requested.emit(config)
+        if not config["source"]:
+            QMessageBox.warning(self, "Missing Source", "Please select a source directory.")
+            return
+        if not config["destinations"]:
+            QMessageBox.warning(self, "Missing Destination", "Please add at least one destination.")
+            return
+        self.run_requested.emit(config)
 
     def _on_trial_sync(self):
         config = self._build_config()
