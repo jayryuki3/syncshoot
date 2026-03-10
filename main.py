@@ -427,7 +427,7 @@ def launch_gui():
         notify_corruption_detected,
         play_completion_sound,
     )
-    from utils.report import TransferReport, FileResult, save_report
+    from utils.report import TransferReport, FileReportEntry, save_report
 
     _active_workers = []
     _transfer_counter = [0]
@@ -637,7 +637,7 @@ def launch_gui():
 
         # Create dashboard card immediately
         card = dashboard.add_transfer(tid, label)
-        from config import TransferStatus as TS
+        from config import TransferStatus as TS, FileOpStatus
         card.update_status(TS.INDEXING)
         _stats["active"] += 1
         _refresh_dashboard_stats()
@@ -711,15 +711,15 @@ def launch_gui():
             report_path = None
             try:
                 file_results_failed = [
-                    FileResult(
+                    FileReportEntry(
                         rel_path=err_path,
-                        status="failed",
+                        status=FileOpStatus.FAILED,
                         error=err_msg,
                     )
                     for err_path, err_msg in result.errors
                 ]
                 file_results_ok = [
-                    FileResult(rel_path=f"({c} files copied)", status="success")
+                    FileReportEntry(rel_path=f"({c} files copied)", status=FileOpStatus.SUCCESS)
                 ] if c > 0 else []
                 report = TransferReport(
                     task_name=task_name,
