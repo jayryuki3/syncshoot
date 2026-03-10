@@ -309,10 +309,35 @@ def launch_gui():
     from PySide6.QtWidgets import QMessageBox
 
     _active_workers = []
+    _transfer_counter = [0]  # mutable counter for unique IDs
+    _stats = {"active": 0, "complete": 0, "failed": 0,
+              "bytes": 0, "speed_samples": []}
+
+    def _fmt_bytes(n):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(n) < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    def _refresh_dashboard_stats():
+        avg_speed = 0.0
+        samples = _stats["speed_samples"]
+        if samples:
+            avg_speed = sum(samples) / len(samples)
+        dashboard.update_stats(
+            _stats["active"],
+            _stats["complete"],
+            _stats["failed"],
+            _fmt_bytes(_stats["bytes"]),
+            f"{avg_speed:.1f} MB/s",
+        )
+        window.set_active_count(_stats["active"])
 
     class _SyncWorker(QObject):
         finished = QtSignal(object)
         error = QtSignal(str)
+        progress = QtSignal(int, int, str, str)  # done, total, file, op
         def __init__(self, cfg, execute=False):
             super().__init__()
             self._cfg = cfg
@@ -329,7 +354,10 @@ def launch_gui():
                 )
                 plan = plan_sync(src, dst, mode, algo)
                 if self._execute:
-                    self.finished.emit(execute_sync(plan))
+                    def _cb(done, total, rel_path, op_type):
+                        self.progress.emit(done, total, rel_path, op_type)
+                    result = execute_sync(plan, progress_cb=_cb)
+                    self.finished.emit(result)
                 else:
                     self.finished.emit(plan)
             except Exception as e:
@@ -370,30 +398,98 @@ def launch_gui():
         t.start()
         _active_workers.append((t, w))
 
-    def _on_run_task(config):
-        window.set_status("Running task...")
+    def _run_single_task(config):
+        """Run a single task config with dashboard integration."""
+        import time as _time
+        _transfer_counter[0] += 1
+        tid = f"transfer_{_transfer_counter[0]}_{int(_time.time())}"
+        task_name = config.get("task_name", "Untitled")
+        src = config.get("source", "?")
+        dst = config.get("destinations", ["?"])[0]
+        label = f"{task_name} ({Path(src).name} -> {Path(dst).name})"
+
+        card = dashboard.add_transfer(tid, label)
+        from config import TransferStatus as TS
+        card.update_status(TS.INDEXING)
+        _stats["active"] += 1
+        _refresh_dashboard_stats()
+
         w = _SyncWorker(config, execute=True)
         t = QThread(window)
         w.moveToThread(t)
-        def done(result):
+
+        _start_time = [_time.time()]
+        _bytes_so_far = [0]
+
+        def on_progress(done, total, rel_path, op_type):
+            if total == 0:
+                pct = 0
+            else:
+                pct = int(done / total * 100)
+            elapsed = _time.time() - _start_time[0]
+            speed = _bytes_so_far[0] / (1024 * 1024 * max(elapsed, 0.01))
+            if total > done:
+                remaining = (elapsed / max(done, 1)) * (total - done)
+                mins, secs = divmod(int(remaining), 60)
+                eta = f"{mins}m {secs}s"
+            else:
+                eta = "--"
+            size_str = f"{done}/{total} files"
+            card.update_progress(pct, rel_path, speed, eta, size_str)
+            card.update_status(TS.COPYING)
+            window.set_speed(speed)
+
+        def on_done(result):
+            _stats["active"] = max(0, _stats["active"] - 1)
+            _stats["bytes"] += result.bytes_transferred
+            elapsed = result.elapsed if result.elapsed > 0 else 0.01
+            spd = result.bytes_transferred / (1024 * 1024 * elapsed)
+            _stats["speed_samples"].append(spd)
+            if len(_stats["speed_samples"]) > 20:
+                _stats["speed_samples"] = _stats["speed_samples"][-20:]
             c = result.files_copied
             s = result.files_skipped
             f = result.files_failed
+            if f > 0:
+                card.update_status(TS.FAILED)
+                _stats["failed"] += 1
+            else:
+                card.update_status(TS.COMPLETE)
+                _stats["complete"] += 1
+            card.update_progress(
+                100,
+                f"Done: {c} copied, {s} skipped, {f} failed",
+                0.0, "--",
+                _fmt_bytes(result.bytes_transferred),
+            )
+            _refresh_dashboard_stats()
             window.set_status(
-                f"Done: {c} copied, {s} skipped, {f} failed"
+                f"{task_name}: {c} copied, {s} skipped, {f} failed"
             )
+            window.set_speed(0.0)
             t.quit()
-        def err(msg):
-            QMessageBox.critical(
-                window, "Task Error", msg
-            )
-            window.set_status("Task failed")
+
+        def on_err(msg):
+            _stats["active"] = max(0, _stats["active"] - 1)
+            _stats["failed"] += 1
+            card.update_status(TS.FAILED)
+            card.update_progress(0, f"Error: {msg}", 0.0, "--", "--")
+            _refresh_dashboard_stats()
+            QMessageBox.critical(window, "Task Error", msg)
+            window.set_status(f"{task_name} failed")
+            window.set_speed(0.0)
             t.quit()
-        w.finished.connect(done)
-        w.error.connect(err)
+
+        w.progress.connect(on_progress)
+        w.finished.connect(on_done)
+        w.error.connect(on_err)
         t.started.connect(w.run)
         t.start()
         _active_workers.append((t, w))
+
+    def _on_run_task(config):
+        """Run Now button handler — delegates to _run_single_task."""
+        _run_single_task(config)
 
     def _on_task_saved(path):
         window.set_status(f"Task saved: {path}")
@@ -402,6 +498,33 @@ def launch_gui():
     task_editor.trial_sync_requested.connect(_on_trial_sync)
     task_editor.run_requested.connect(_on_run_task)
     task_editor.task_saved.connect(_on_task_saved)
+
+    # +New Task -> reset form
+    window.new_task_requested.connect(task_editor.reset_form)
+
+    # Run All -> load all saved tasks and run each
+    def _on_run_all():
+        from config import TASKS_DIR
+        task_files = list(TASKS_DIR.glob("*.json"))
+        if not task_files:
+            QMessageBox.information(
+                window, "No Tasks",
+                "No saved tasks found. Create and save a task first."
+            )
+            window.set_status("No saved tasks to run")
+            return
+        count = 0
+        for tf in task_files:
+            try:
+                cfg = json.loads(tf.read_text())
+                if cfg.get("source") and cfg.get("destinations"):
+                    _run_single_task(cfg)
+                    count += 1
+            except Exception as e:
+                logger.error(f"Failed to load task {tf.name}: {e}")
+        window.set_status(f"Running {count} task(s)...")
+
+    window.run_all_requested.connect(_on_run_all)
 
     def _load_task_file(fpath):
         try:
