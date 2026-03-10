@@ -301,6 +301,122 @@ def launch_gui():
     window.register_panel(4, archive_browser)
     window.register_panel(5, log_viewer)
 
+    # -- Wire Task Editor signals to engine --
+    from engine.sync import plan_sync, execute_sync
+    from engine.sync import SyncMode as EngSyncMode
+    from PySide6.QtCore import QThread, QObject
+    from PySide6.QtCore import Signal as QtSignal
+    from PySide6.QtWidgets import QMessageBox
+
+    _active_workers = []
+
+    class _SyncWorker(QObject):
+        finished = QtSignal(object)
+        error = QtSignal(str)
+        def __init__(self, cfg, execute=False):
+            super().__init__()
+            self._cfg = cfg
+            self._execute = execute
+        def run(self):
+            try:
+                src = Path(self._cfg["source"])
+                dst = Path(self._cfg["destinations"][0])
+                mode = EngSyncMode(
+                    self._cfg.get("sync_mode", "backup")
+                )
+                algo = HashAlgorithm(
+                    self._cfg.get("hash_algorithm", "xxh3_64")
+                )
+                plan = plan_sync(src, dst, mode, algo)
+                if self._execute:
+                    self.finished.emit(execute_sync(plan))
+                else:
+                    self.finished.emit(plan)
+            except Exception as e:
+                self.error.emit(str(e))
+
+    def _on_trial_sync(config):
+        window.set_status("Running Trial Sync...")
+        w = _SyncWorker(config, execute=False)
+        t = QThread(window)
+        w.moveToThread(t)
+        def done(plan):
+            ops = []
+            for o in plan.operations:
+                ops.append({
+                    "rel_path": o.rel_path,
+                    "op": o.op.value,
+                    "src_size": o.src_size,
+                    "dst_size": o.dst_size,
+                    "reason": o.reason,
+                })
+            task_editor.show_preview_results(ops)
+            nc = len(plan.copies)
+            nd = len(plan.deletions)
+            ns = len(plan.skips)
+            window.set_status(
+                f"Trial done: {nc} copy, {nd} del, {ns} skip"
+            )
+            t.quit()
+        def err(msg):
+            QMessageBox.critical(
+                window, "Trial Sync Error", msg
+            )
+            window.set_status("Trial Sync failed")
+            t.quit()
+        w.finished.connect(done)
+        w.error.connect(err)
+        t.started.connect(w.run)
+        t.start()
+        _active_workers.append((t, w))
+
+    def _on_run_task(config):
+        window.set_status("Running task...")
+        w = _SyncWorker(config, execute=True)
+        t = QThread(window)
+        w.moveToThread(t)
+        def done(result):
+            c = result.files_copied
+            s = result.files_skipped
+            f = result.files_failed
+            window.set_status(
+                f"Done: {c} copied, {s} skipped, {f} failed"
+            )
+            t.quit()
+        def err(msg):
+            QMessageBox.critical(
+                window, "Task Error", msg
+            )
+            window.set_status("Task failed")
+            t.quit()
+        w.finished.connect(done)
+        w.error.connect(err)
+        t.started.connect(w.run)
+        t.start()
+        _active_workers.append((t, w))
+
+    def _on_task_saved(path):
+        window.set_status(f"Task saved: {path}")
+        logger.info(f"Task saved: {path}")
+
+    task_editor.trial_sync_requested.connect(_on_trial_sync)
+    task_editor.run_requested.connect(_on_run_task)
+    task_editor.task_saved.connect(_on_task_saved)
+
+    def _load_task_file(fpath):
+        try:
+            cfg = json.loads(Path(fpath).read_text())
+            task_editor.load_config(cfg)
+            window.set_status(
+                f"Loaded: {Path(fpath).name}"
+            )
+            window._switch_panel(1)
+        except Exception as e:
+            QMessageBox.critical(
+                window, "Load Error", str(e)
+            )
+    window.task_file_opened.connect(_load_task_file)
+
     # Setup system tray
     app.setup_tray(window)
 
